@@ -1,3 +1,4 @@
+```yaml
 name: Build and Deploy Docker Images
 
 on:
@@ -8,40 +9,24 @@ on:
 jobs:
 
   # ==========================================
-  # STAGE 1: LOGIN
-  # ==========================================
-  login:
-    name: Docker Hub Login
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_PASSWORD }}
-
-
-  # ==========================================
-  # STAGE 2: BUILD & PUSH BACKEND
+  # STAGE 1: BUILD & PUSH BACKEND
   # ==========================================
   build-backend:
     name: Build and Push Backend
-    needs: login
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
       - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_PASSWORD }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Build and Push Backend Image
         uses: docker/build-push-action@v6
@@ -54,25 +39,24 @@ jobs:
 
 
   # ==========================================
-  # STAGE 3: BUILD & PUSH FRONTEND
+  # STAGE 2: BUILD & PUSH FRONTEND
   # ==========================================
   build-frontend:
     name: Build and Push Frontend
-    needs: login
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
       - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_PASSWORD }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Build and Push Frontend Image
         uses: docker/build-push-action@v6
@@ -85,14 +69,15 @@ jobs:
 
 
   # ==========================================
-  # STAGE 4: DEPLOY BACKEND
+  # STAGE 3: DEPLOY MYSQL DATABASE
   # ==========================================
-  deploy-backend:
-    name: Deploy Backend
-    needs: build-backend
+  deploy-database:
+    name: Deploy MySQL Container
+    needs: [build-backend, build-frontend]
     runs-on: ubuntu-latest
 
     steps:
+
       - name: Check SSH connection
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -100,9 +85,109 @@ jobs:
           username: ubuntu
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
+            echo "======================================"
             echo "SSH CONNECTION SUCCESS"
+            echo "======================================"
             whoami
             hostname
+            docker --version
+            docker compose version || true
+
+      - name: Create Docker Network
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            echo "Creating Docker network..."
+
+            docker network inspect sms-network >/dev/null 2>&1 || \
+            docker network create sms-network
+
+            echo "Docker network ready."
+
+
+      - name: Deploy MySQL to EC2
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            echo "======================================"
+            echo "Deploying MySQL"
+            echo "======================================"
+
+            docker pull mysql:8.0
+
+            echo "Stopping old MySQL container..."
+            docker stop sms-mysql || true
+
+            echo "Removing old MySQL container..."
+            docker rm sms-mysql || true
+
+            echo "Starting MySQL container..."
+
+            docker run -d \
+              --name sms-mysql \
+              --restart unless-stopped \
+              --network sms-network \
+              -p 3306:3306 \
+              -e MYSQL_ROOT_PASSWORD=root \
+              -e MYSQL_DATABASE=sms \
+              -e MYSQL_USER=sms_user \
+              -e MYSQL_PASSWORD=root \
+              -v sms-mysql-data:/var/lib/mysql \
+              mysql:8.0
+
+            echo "Waiting for MySQL to become ready..."
+
+            for i in {1..30}; do
+              if docker exec sms-mysql \
+                mysqladmin ping \
+                -h 127.0.0.1 \
+                -u root \
+                -proot \
+                --silent; then
+
+                echo "MySQL is ready!"
+                break
+              fi
+
+              echo "Waiting for MySQL... attempt $i/30"
+              sleep 2
+            done
+
+            echo "MySQL status:"
+            docker ps --filter name=sms-mysql
+
+            echo "MySQL deployment completed successfully."
+
+
+  # ==========================================
+  # STAGE 4: DEPLOY BACKEND
+  # ==========================================
+  deploy-backend:
+    name: Deploy Backend
+    needs: [build-backend, deploy-database]
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Check SSH connection
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            echo "======================================"
+            echo "SSH CONNECTION SUCCESS"
+            echo "======================================"
+            whoami
+            hostname
+
 
       - name: Deploy Backend to EC2
         uses: appleboy/ssh-action@v1.0.3
@@ -111,20 +196,48 @@ jobs:
           username: ubuntu
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
-            echo "Deploying backend..."
+            echo "======================================"
+            echo "Deploying Backend"
+            echo "======================================"
 
-            docker pull ${{ secrets.DOCKERHUB_USERNAME }}/sms-backend:v${{ github.run_number }}
+            echo "Pulling backend image..."
+
+            docker pull \
+              ${{ secrets.DOCKERHUB_USERNAME }}/sms-backend:v${{ github.run_number }}
+
+            echo "Stopping old backend..."
 
             docker stop sms-backend || true
+
+            echo "Removing old backend..."
+
             docker rm sms-backend || true
+
+            echo "Starting backend..."
 
             docker run -d \
               --name sms-backend \
               --restart unless-stopped \
+              --network sms-network \
               -p 8000:8000 \
+              -e MYSQL_HOST=sms-mysql \
+              -e MYSQL_PORT=3306 \
+              -e MYSQL_USER=sms_user \
+              -e MYSQL_PASSWORD=root \
+              -e MYSQL_DATABASE=sms \
               ${{ secrets.DOCKERHUB_USERNAME }}/sms-backend:v${{ github.run_number }}
 
-            echo "Backend deployed successfully"
+            echo "Waiting for backend to start..."
+
+            sleep 10
+
+            echo "Backend container status:"
+            docker ps --filter name=sms-backend
+
+            echo "Backend logs:"
+            docker logs --tail 30 sms-backend
+
+            echo "Backend deployment completed successfully."
 
 
   # ==========================================
@@ -132,10 +245,11 @@ jobs:
   # ==========================================
   deploy-frontend:
     name: Deploy Frontend
-    needs: build-frontend
+    needs: [build-frontend, deploy-backend]
     runs-on: ubuntu-latest
 
     steps:
+
       - name: Check SSH connection
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -143,9 +257,12 @@ jobs:
           username: ubuntu
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
+            echo "======================================"
             echo "SSH CONNECTION SUCCESS"
+            echo "======================================"
             whoami
             hostname
+
 
       - name: Deploy Frontend to EC2
         uses: appleboy/ssh-action@v1.0.3
@@ -154,12 +271,24 @@ jobs:
           username: ubuntu
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
-            echo "Deploying frontend..."
+            echo "======================================"
+            echo "Deploying Frontend"
+            echo "======================================"
 
-            docker pull ${{ secrets.DOCKERHUB_USERNAME }}/sms-frontend:v${{ github.run_number }}
+            echo "Pulling frontend image..."
+
+            docker pull \
+              ${{ secrets.DOCKERHUB_USERNAME }}/sms-frontend:v${{ github.run_number }}
+
+            echo "Stopping old frontend..."
 
             docker stop sms-frontend || true
+
+            echo "Removing old frontend..."
+
             docker rm sms-frontend || true
+
+            echo "Starting frontend..."
 
             docker run -d \
               --name sms-frontend \
@@ -167,4 +296,37 @@ jobs:
               -p 80:5173 \
               ${{ secrets.DOCKERHUB_USERNAME }}/sms-frontend:v${{ github.run_number }}
 
-            echo "Frontend deployed successfully"
+            echo "Waiting for frontend to start..."
+
+            sleep 5
+
+            echo "Frontend container status:"
+            docker ps --filter name=sms-frontend
+
+            echo "Frontend logs:"
+            docker logs --tail 20 sms-frontend
+
+            echo "Frontend deployment completed successfully."
+
+
+  # ==========================================
+  # STAGE 6: DEPLOYMENT STATUS
+  # ==========================================
+  deployment-status:
+    name: Deployment Completed
+    needs:
+      - deploy-database
+      - deploy-backend
+      - deploy-frontend
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deployment Success
+        run: |
+          echo "======================================"
+          echo "SMS APPLICATION DEPLOYMENT SUCCESS"
+          echo "======================================"
+          echo "Backend  : Port 8000"
+          echo "Frontend : Port 80"
+          echo "MySQL    : Port 3306"
+          echo "======================================"
